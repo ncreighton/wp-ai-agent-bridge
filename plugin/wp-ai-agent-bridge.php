@@ -10,9 +10,17 @@ if ( ! defined('ABSPATH') ) exit;
 
 class WPAIAgentBridge {
 
+    /**
+     * Tracks whether the MCP plugin has been detected during the request lifecycle.
+     *
+     * @var bool
+     */
+    private $mcp_detected = false;
+
     public function __construct() {
         add_action('rest_api_init', [$this, 'register_routes']);
         add_action('admin_init', [$this, 'maybe_add_default_token']);
+        add_action('plugins_loaded', [$this, 'bootstrap_mcp_support']);
     }
 
     /**
@@ -515,6 +523,570 @@ class WPAIAgentBridge {
             'success' => true,
             'report'  => $report
         ];
+    }
+
+    /**
+     * Initialize optional WordPress MCP support (if the plugin is available).
+     */
+    public function bootstrap_mcp_support() {
+        if ( $this->is_mcp_plugin_loaded() ) {
+            $this->mcp_detected = true;
+        }
+
+        add_action('mcp_register_functions', [$this, 'register_mcp_functions'], 10, 1);
+        add_filter('mcp_register_functions', [$this, 'maybe_append_mcp_functions']);
+        add_filter('wordpress_mcp_functions', [$this, 'maybe_append_mcp_functions']);
+    }
+
+    /**
+     * Register MCP functions using whatever registry structure the MCP plugin provides.
+     *
+     * @param mixed $registry Registry/context object provided by the MCP plugin.
+     */
+    public function register_mcp_functions( $registry ) {
+        $this->mcp_detected = true;
+
+        foreach ( $this->get_mcp_function_definitions() as $definition ) {
+            $this->attempt_registry_registration($registry, $definition);
+        }
+    }
+
+    /**
+     * Append MCP function definitions when the plugin expects a filter that returns an array.
+     *
+     * @param mixed $functions Existing MCP function definitions.
+     *
+     * @return mixed
+     */
+    public function maybe_append_mcp_functions( $functions ) {
+        $this->mcp_detected = true;
+
+        if ( ! is_array($functions) ) {
+            return $functions;
+        }
+
+        $definitions = $this->get_mcp_function_definitions();
+        if ( empty($definitions) ) {
+            return $functions;
+        }
+
+        if ( $this->is_list_array($functions) ) {
+            $existing = [];
+            foreach ( $functions as $item ) {
+                if ( is_array($item) && isset($item['name']) ) {
+                    $existing[ $item['name'] ] = true;
+                } elseif ( is_object($item) && isset($item->name) ) {
+                    $existing[ $item->name ] = true;
+                }
+            }
+            foreach ( $definitions as $definition ) {
+                if ( isset($existing[ $definition['name'] ]) ) {
+                    continue;
+                }
+                $functions[] = $definition;
+            }
+        } else {
+            foreach ( $definitions as $definition ) {
+                if ( isset($functions[ $definition['name'] ]) ) {
+                    continue;
+                }
+                $functions[ $definition['name'] ] = $definition;
+            }
+        }
+
+        return $functions;
+    }
+
+    /**
+     * Determine whether the MCP plugin (or a compatible bridge) appears to be loaded.
+     *
+     * @return bool
+     */
+    private function is_mcp_plugin_loaded() {
+        if ( $this->mcp_detected ) {
+            return true;
+        }
+
+        if ( defined('WORDPRESS_MCP_VERSION') ) {
+            return true;
+        }
+
+        $classes = [
+            '\\Automattic\\WordPress\\MCP\\Plugin',
+            '\\Automattic\\WordPress\\MCP\\Server',
+            '\\Automattic\\WP\\MCP\\Plugin',
+            '\\Automattic\\WP\\MCP\\Server',
+        ];
+
+        foreach ( $classes as $class ) {
+            if ( class_exists($class) ) {
+                return true;
+            }
+        }
+
+        if ( has_action('mcp_register_functions') || has_filter('mcp_register_functions') || has_filter('wordpress_mcp_functions') ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Attempt to register an MCP function definition with an arbitrary registry implementation.
+     *
+     * @param mixed $registry   Registry/context supplied by the MCP plugin.
+     * @param array $definition Function definition array.
+     */
+    private function attempt_registry_registration( $registry, array $definition ) {
+        if ( is_object($registry) ) {
+            if ( method_exists($registry, 'register_function') ) {
+                try {
+                    $registry->register_function(
+                        $definition['name'],
+                        $definition['callback'],
+                        $definition['parameters'],
+                        $definition['description'],
+                        $definition['returns']
+                    );
+                    return;
+                } catch ( \Throwable $e ) {
+                    // fall back to other registration strategies
+                }
+            }
+
+            if ( method_exists($registry, 'register') ) {
+                try {
+                    $reflection = new \ReflectionMethod($registry, 'register');
+                    $param_count = $reflection->getNumberOfParameters();
+
+                    if ( 1 === $param_count ) {
+                        $definition_object = $this->maybe_build_mcp_definition_object($definition);
+                        if ( $definition_object ) {
+                            $registry->register($definition_object);
+                            return;
+                        }
+                    } elseif ( 2 === $param_count ) {
+                        $registry->register($definition['name'], $definition);
+                        return;
+                    } elseif ( 3 === $param_count ) {
+                        $registry->register($definition['name'], $definition['callback'], $definition['parameters']);
+                        return;
+                    } elseif ( 4 <= $param_count ) {
+                        $arguments = [
+                            $definition['name'],
+                            $definition['callback'],
+                            $definition['parameters'],
+                            $definition['description'],
+                        ];
+
+                        if ( $param_count >= 5 ) {
+                            $arguments[] = $definition['returns'];
+                        }
+
+                        $registry->register(...$arguments);
+                        return;
+                    }
+                } catch ( \Throwable $e ) {
+                    // continue to other strategies
+                }
+            }
+
+            if ( method_exists($registry, 'add') ) {
+                try {
+                    $registry->add($definition['name'], $definition);
+                    return;
+                } catch ( \Throwable $e ) {
+                    // ignore
+                }
+            }
+
+            if ( $registry instanceof \ArrayAccess ) {
+                try {
+                    $registry[ $definition['name'] ] = $definition;
+                    return;
+                } catch ( \Throwable $e ) {
+                    // ignore
+                }
+            }
+        }
+
+        if ( is_callable($registry) ) {
+            try {
+                call_user_func($registry, $definition);
+                return;
+            } catch ( \Throwable $e ) {
+                // ignore
+            }
+        }
+    }
+
+    /**
+     * Attempt to build an MCP FunctionDefinition object if the class exists.
+     *
+     * @param array $definition Function definition array.
+     *
+     * @return object|null
+     */
+    private function maybe_build_mcp_definition_object( array $definition ) {
+        $candidates = [
+            '\\Automattic\\WordPress\\MCP\\Types\\FunctionDefinition',
+            '\\Automattic\\WP\\MCP\\Types\\FunctionDefinition',
+            '\\Automattic\\MCP\\Types\\FunctionDefinition',
+        ];
+
+        foreach ( $candidates as $class ) {
+            if ( class_exists($class) && method_exists($class, 'from_array') ) {
+                try {
+                    return $class::from_array([
+                        'name'        => $definition['name'],
+                        'description' => $definition['description'],
+                        'parameters'  => $definition['parameters'],
+                        'returns'     => $definition['returns'],
+                    ]);
+                } catch ( \Throwable $e ) {
+                    // ignore and try next candidate
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Retrieve MCP function definitions for this bridge.
+     *
+     * @return array
+     */
+    private function get_mcp_function_definitions() {
+        return [
+            [
+                'name'        => 'wpai.site_info',
+                'description' => 'Retrieve WordPress site information via WP AI Agent Bridge.',
+                'parameters'  => [
+                    'type'                 => 'object',
+                    'properties'           => new \stdClass(),
+                    'additionalProperties' => false,
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Details about the WordPress site configuration.',
+                ],
+                'callback'    => [$this, 'mcp_site_info'],
+            ],
+            [
+                'name'        => 'wpai.basic_setup',
+                'description' => 'Configure core WordPress settings such as permalinks, timezone, and site title.',
+                'parameters'  => [
+                    'type'       => 'object',
+                    'properties' => [
+                        'permalink'        => ['type' => 'string'],
+                        'timezone'         => ['type' => 'string'],
+                        'blogname'         => ['type' => 'string'],
+                        'blogdescription'  => ['type' => 'string'],
+                    ],
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Result of the setup operation.',
+                ],
+                'callback'    => [$this, 'mcp_basic_setup'],
+            ],
+            [
+                'name'        => 'wpai.create_categories',
+                'description' => 'Bulk create WordPress categories.',
+                'parameters'  => [
+                    'type'       => 'object',
+                    'properties' => [
+                        'categories' => [
+                            'type'  => 'array',
+                            'items' => [
+                                'type'       => 'object',
+                                'properties' => [
+                                    'name' => ['type' => 'string'],
+                                    'slug' => ['type' => 'string'],
+                                ],
+                                'required'   => ['name'],
+                            ],
+                        ],
+                    ],
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Status of category creation.',
+                ],
+                'callback'    => [$this, 'mcp_create_categories'],
+            ],
+            [
+                'name'        => 'wpai.create_page',
+                'description' => 'Create or update a WordPress page.',
+                'parameters'  => [
+                    'type'       => 'object',
+                    'properties' => [
+                        'title'   => ['type' => 'string'],
+                        'slug'    => ['type' => 'string'],
+                        'content' => ['type' => 'string'],
+                        'status'  => ['type' => 'string'],
+                    ],
+                    'required'   => ['title'],
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Result of the page operation.',
+                ],
+                'callback'    => [$this, 'mcp_create_or_update_page'],
+            ],
+            [
+                'name'        => 'wpai.create_menu',
+                'description' => 'Create or update a navigation menu.',
+                'parameters'  => [
+                    'type'       => 'object',
+                    'properties' => [
+                        'location' => ['type' => 'string'],
+                        'name'     => ['type' => 'string'],
+                        'items'    => [
+                            'type'  => 'array',
+                            'items' => [
+                                'type'       => 'object',
+                                'properties' => [
+                                    'title' => ['type' => 'string'],
+                                    'url'   => ['type' => 'string'],
+                                ],
+                                'required'   => ['title', 'url'],
+                            ],
+                        ],
+                    ],
+                    'required'   => ['name'],
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Result of the menu operation.',
+                ],
+                'callback'    => [$this, 'mcp_create_or_update_menu'],
+            ],
+            [
+                'name'        => 'wpai.set_homepage',
+                'description' => 'Set the static homepage to a specific page.',
+                'parameters'  => [
+                    'type'       => 'object',
+                    'properties' => [
+                        'page_id' => ['type' => 'integer'],
+                        'slug'    => ['type' => 'string'],
+                    ],
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Result of the homepage assignment.',
+                ],
+                'callback'    => [$this, 'mcp_set_homepage'],
+            ],
+            [
+                'name'        => 'wpai.rankmath_setup',
+                'description' => 'Configure Rank Math SEO defaults when the plugin is active.',
+                'parameters'  => [
+                    'type'                 => 'object',
+                    'properties'           => new \stdClass(),
+                    'additionalProperties' => false,
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Result of the Rank Math configuration.',
+                ],
+                'callback'    => [$this, 'mcp_rankmath_setup'],
+            ],
+            [
+                'name'        => 'wpai.set_option',
+                'description' => 'Update a WordPress option with a provided value.',
+                'parameters'  => [
+                    'type'       => 'object',
+                    'properties' => [
+                        'option_name'  => ['type' => 'string'],
+                        'option_value' => [],
+                    ],
+                    'required'   => ['option_name'],
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Result of the option update.',
+                ],
+                'callback'    => [$this, 'mcp_set_option'],
+            ],
+            [
+                'name'        => 'wpai.get_plugins',
+                'description' => 'List installed plugins with their activation state.',
+                'parameters'  => [
+                    'type'                 => 'object',
+                    'properties'           => new \stdClass(),
+                    'additionalProperties' => false,
+                ],
+                'returns'     => [
+                    'type'        => 'array',
+                    'description' => 'Array of plugins with metadata.',
+                    'items'       => ['type' => 'object'],
+                ],
+                'callback'    => [$this, 'mcp_get_plugins'],
+            ],
+            [
+                'name'        => 'wpai.install_plugin',
+                'description' => 'Install and activate a plugin from WordPress.org.',
+                'parameters'  => [
+                    'type'       => 'object',
+                    'properties' => [
+                        'slug' => ['type' => 'string'],
+                    ],
+                    'required'   => ['slug'],
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Result of the plugin installation.',
+                ],
+                'callback'    => [$this, 'mcp_install_plugin'],
+            ],
+            [
+                'name'        => 'wpai.run_blueprint',
+                'description' => 'Execute a full site blueprint covering basics, categories, pages, menus, and plugin setup.',
+                'parameters'  => [
+                    'type'       => 'object',
+                    'properties' => [
+                        'basic'                 => ['type' => 'object'],
+                        'categories'            => ['type' => 'array'],
+                        'pages'                 => ['type' => 'array'],
+                        'menus'                 => ['type' => 'array'],
+                        'homepage'              => ['type' => 'object'],
+                        'plugins_to_configure'  => ['type' => 'array'],
+                    ],
+                ],
+                'returns'     => [
+                    'type'        => 'object',
+                    'description' => 'Report of actions performed while running the blueprint.',
+                ],
+                'callback'    => [$this, 'mcp_run_blueprint'],
+            ],
+        ];
+    }
+
+    /**
+     * Determine if an array is numerically indexed.
+     *
+     * @param array $array Array to inspect.
+     *
+     * @return bool
+     */
+    private function is_list_array( array $array ) {
+        if ( empty($array) ) {
+            return true;
+        }
+
+        $expected = range(0, count($array) - 1);
+        return $expected === array_keys($array);
+    }
+
+    /**
+     * Normalize incoming MCP arguments.
+     *
+     * @param mixed $args Arguments provided by the MCP runtime.
+     *
+     * @return array
+     */
+    private function normalize_mcp_arguments( $args ) {
+        if ( is_array($args) ) {
+            return $args;
+        }
+
+        if ( is_object($args) ) {
+            $encoder = function_exists('wp_json_encode') ? 'wp_json_encode' : 'json_encode';
+            $decoded = json_decode($encoder($args), true);
+            if ( is_array($decoded) ) {
+                return $decoded;
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * Helper to build WP_REST_Request instances for MCP callbacks.
+     *
+     * @param string $method HTTP verb.
+     * @param string $route  Route being simulated.
+     * @param array  $params Parameters to attach.
+     *
+     * @return WP_REST_Request
+     */
+    private function build_rest_request_for_mcp( $method, $route, array $params = [] ) {
+        $request = new WP_REST_Request($method, $route);
+
+        if ( strtoupper($method) === 'GET' ) {
+            $request->set_query_params($params);
+        } else {
+            $request->set_body_params($params);
+        }
+
+        return $request;
+    }
+
+    /**
+     * MCP callback wrappers that reuse the existing REST implementations.
+     */
+
+    public function mcp_site_info() {
+        return $this->site_info();
+    }
+
+    public function mcp_basic_setup( $args = [] ) {
+        $params = $this->normalize_mcp_arguments($args);
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/basic-setup', $params);
+        return $this->basic_setup($request);
+    }
+
+    public function mcp_create_categories( $args = [] ) {
+        $params = $this->normalize_mcp_arguments($args);
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/categories', $params);
+        return $this->create_categories($request);
+    }
+
+    public function mcp_create_or_update_page( $args = [] ) {
+        $params = $this->normalize_mcp_arguments($args);
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/pages', $params);
+        return $this->create_or_update_page($request);
+    }
+
+    public function mcp_create_or_update_menu( $args = [] ) {
+        $params = $this->normalize_mcp_arguments($args);
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/menus', $params);
+        return $this->create_or_update_menu($request);
+    }
+
+    public function mcp_set_homepage( $args = [] ) {
+        $params = $this->normalize_mcp_arguments($args);
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/set-homepage', $params);
+        return $this->set_homepage($request);
+    }
+
+    public function mcp_rankmath_setup() {
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/rankmath-setup', []);
+        return $this->rankmath_setup($request);
+    }
+
+    public function mcp_set_option( $args = [] ) {
+        $params = $this->normalize_mcp_arguments($args);
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/set-option', $params);
+        return $this->set_option($request);
+    }
+
+    public function mcp_get_plugins() {
+        return $this->get_plugins();
+    }
+
+    public function mcp_install_plugin( $args = [] ) {
+        $params = $this->normalize_mcp_arguments($args);
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/install-plugin', $params);
+        return $this->install_plugin($request);
+    }
+
+    public function mcp_run_blueprint( $args = [] ) {
+        $params = $this->normalize_mcp_arguments($args);
+        $request = $this->build_rest_request_for_mcp('POST', '/wpai/v1/run-blueprint', $params);
+        return $this->run_blueprint($request);
     }
 
 }
