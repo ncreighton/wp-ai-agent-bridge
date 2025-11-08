@@ -26,3 +26,33 @@ This plugin exposes a secure REST API bridge for external AI models (OpenAI GPT-
 ## 🧩 Installation
 
 1. Copy the `plugin/wp-ai-agent-bridge.php` file into:
+/wp-content/plugins/wp-ai-agent-bridge/wp-ai-agent-bridge.php
+
+markdown
+Copy code
+
+2. Activate the plugin in **WordPress Admin → Plugins**.
+
+3. Find your **API token**:
+- Go to **Settings → General → AI Agent Token**
+- (If not visible, view in `wp_options` table: `wpai_agent_token`)
+
+4. Send requests with:
+Header: x-wpai-token: <your_token>
+
+yaml
+Copy code
+
+---
+
+## 🧠 Example Use
+
+```bash
+curl -X POST "https://example.com/wp-json/wpai/v1/basic-setup" \
+-H "x-wpai-token: yourtoken" \
+-H "Content-Type: application/json" \
+-d '{
+ "blogname": "SmartHomeWizards.com",
+ "blogdescription": "Smart home automation guides",
+ "timezone": "America/New_York"
+}'
